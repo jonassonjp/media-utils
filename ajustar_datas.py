@@ -7,8 +7,9 @@ import shutil
 import signal
 import subprocess
 import fnmatch
+import tempfile
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 LIMITE_PREVIA = 20
 
@@ -27,6 +28,11 @@ TAG_VIDEO = "QuickTime:CreateDate"
 # Fuso da câmera em relação ao UTC: diferença entre a hora das fotos e dos vídeos.
 # Medido na Insta360 Ace Pro 2 (fotos = vídeos + 1h).
 FUSO_CAMERA_PADRAO = 1
+
+# Extensões em que o exiftool grava datas internas com segurança
+EXTENSOES_FOTO = {".jpg", ".jpeg", ".insp", ".dng", ".heic"}
+EXTENSOES_VIDEO = {".mp4", ".mov", ".insv", ".lrv", ".m4v"}
+FORMATO_EXIF = "%Y:%m:%d %H:%M:%S"
 
 # Nome renomeável: PREFIXO_AAAAMMDD_HHMMSS seguido de "_", "." ou fim do nome.
 # Aceita hora com 5 dígitos (nomes editados à mão, ex: IMG_20261108_09319_001.mp4).
@@ -151,15 +157,22 @@ def calcular_data(caminho, modo, parametros):
                                  day=data_fixa_dma.day)
     return None
 
-def nome_desejado_por_data(nome_antigo, nova_dt):
+def eh_video(nome):
+    return os.path.splitext(nome)[1].lower() in EXTENSOES_VIDEO
+
+def nome_desejado_por_data(nome_antigo, nova_dt, prefixo_vid=False):
     """
     Se o nome seguir o padrão, retorna o novo nome com a data/hora atualizada (ou None).
     Hora com 5 dígitos é substituída pela hora correta com 6 dígitos.
+    Com prefixo_vid, vídeos com prefixo IMG_ passam a usar VID_.
     """
     match = PADRAO_NOME_RENOMEAVEL.match(nome_antigo)
     if not match:
         return None
-    novo_nome = f"{match.group(1)}_{nova_dt.strftime('%Y%m%d_%H%M%S')}{match.group(2)}"
+    prefixo = match.group(1)
+    if prefixo_vid and prefixo == "IMG" and eh_video(nome_antigo):
+        prefixo = "VID"
+    novo_nome = f"{prefixo}_{nova_dt.strftime('%Y%m%d_%H%M%S')}{match.group(2)}"
     return novo_nome if novo_nome != nome_antigo else None
 
 def adicionar_sufixo(nome, contador):
@@ -237,6 +250,81 @@ def renomear_em_duas_fases(itens):
             print(f"✗ Erro ao renomear {os.path.basename(item['caminho'])}: {e}")
     return renomeados
 
+def suporta_metadados(caminho):
+    extensao = os.path.splitext(caminho)[1].lower()
+    return extensao in EXTENSOES_FOTO or extensao in EXTENSOES_VIDEO
+
+def ler_tags_internas(caminhos):
+    """
+    Lê os campos de data internos que o script pode reescrever.
+    Fotos: os 3 campos EXIF. Vídeos: todas as datas QuickTime (inclusive de cada trilha).
+    Retorna {caminho: {tag: valor}}.
+    """
+    fotos = [c for c in caminhos if not eh_video(c)]
+    videos = [c for c in caminhos if eh_video(c)]
+    resultado = {}
+    for lista, tags in ((fotos, [f"-{t}" for t in TAGS_FOTO]), (videos, ["-QuickTime:Time:All"])):
+        if not lista:
+            continue
+        comando = ["exiftool", "-json", "-G1", "-a", "-q", "-q", "-charset", "filename=utf8",
+                   *tags, "-@", "-"]
+        saida = subprocess.run(comando, input="\n".join(lista), capture_output=True, text=True)
+        for item in json.loads(saida.stdout or "[]"):
+            caminho = item.pop("SourceFile")
+            resultado[caminho] = {k: str(v) for k, v in item.items()}
+    return resultado
+
+def novos_valores_internos(caminho, dt, originais):
+    """
+    Calcula os valores a gravar. Fotos: hora local nos 3 campos EXIF.
+    Vídeos: datas QuickTime em UTC (padrão da especificação); campos com fuso
+    explícito (ex: Keys:CreationDate do iPhone) recebem a hora local com o fuso.
+    """
+    if not eh_video(caminho):
+        return {tag: dt.strftime(FORMATO_EXIF) for tag in TAGS_FOTO}
+    dt_local = dt.astimezone()  # hora ingênua interpretada no fuso do Mac
+    valores = {}
+    for tag, valor in originais.items():
+        if re.search(r"[+-]\d{2}:\d{2}$|Z$", valor):
+            valores[tag] = dt_local.strftime(FORMATO_EXIF) + dt_local.strftime("%z")[:3] + ":" + dt_local.strftime("%z")[3:]
+        else:
+            valores[tag] = dt_local.astimezone(timezone.utc).strftime(FORMATO_EXIF)
+    return valores
+
+def gravar_tags_internas(alteracoes):
+    """
+    alteracoes: {caminho: {tag: valor ou None}} (None apaga o campo).
+    Grava tudo numa única execução do exiftool e confere lendo de volta.
+    Retorna o conjunto de caminhos em que a gravação falhou.
+    """
+    if not alteracoes:
+        return set()
+    with tempfile.NamedTemporaryFile("w", suffix=".args", delete=False, encoding="utf-8") as f:
+        for caminho, tags in alteracoes.items():
+            for tag, valor in tags.items():
+                f.write(f"-{tag}={'' if valor is None else valor}\n")
+            f.write(f"{caminho}\n-execute\n")
+        arquivo_args = f.name
+    try:
+        subprocess.run(["exiftool", "-@", arquivo_args, "-common_args", "-q", "-q",
+                        "-charset", "filename=utf8", "-overwrite_original", "-P"],
+                       capture_output=True, text=True)
+    finally:
+        os.remove(arquivo_args)
+
+    # Confere o resultado
+    lidos = ler_tags_internas(list(alteracoes))
+    falhas = set()
+    for caminho, tags in alteracoes.items():
+        atuais = lidos.get(caminho, {})
+        for tag, valor in tags.items():
+            atual = atuais.get(tag)
+            if (valor is None and atual is not None) or \
+               (valor is not None and (atual is None or atual[:19] != valor[:19])):
+                falhas.add(caminho)
+                break
+    return falhas
+
 def montar_plano(arquivos, modo, parametros):
     plano = []
     for caminho in arquivos:
@@ -252,12 +340,13 @@ def montar_plano(arquivos, modo, parametros):
             else:
                 print(f"✗ Ignorado: Padrão de data não encontrado no nome de '{nome}'")
             continue
-        plano.append({'caminho': caminho, 'dt': dt, 'nome_desejado': nome_desejado_por_data(nome, dt),
+        plano.append({'caminho': caminho, 'dt': dt,
+                      'nome_desejado': nome_desejado_por_data(nome, dt, parametros.get('prefixo_vid')),
                       'fora_do_padrao': not PADRAO_NOME_RENOMEAVEL.match(nome)})
     resolver_nomes_finais(plano)
     return plano
 
-def exibir_previa(plano, caminho_alvo, modo):
+def exibir_previa(plano, caminho_alvo, modo, gravar_metadados=False):
     print("\n" + "=" * 60)
     print("  PRÉVIA DAS ALTERAÇÕES")
     print("=" * 60)
@@ -276,20 +365,47 @@ def exibir_previa(plano, caminho_alvo, modo):
     renomeacoes = sum(1 for i in plano if i['nome_final'])
     print("-" * 60)
     print(f"Arquivos com data alterada: {len(plano)} | Arquivos renomeados: {renomeacoes}")
+    if gravar_metadados:
+        suportados = sum(1 for i in plano if suporta_metadados(i['caminho']))
+        print(f"Metadados internos (EXIF/vídeo) atualizados em: {suportados} arquivo(s)"
+              + (f" ({len(plano) - suportados} sem suporte)" if suportados < len(plano) else ""))
     fora_do_padrao = sum(1 for i in plano if i['fora_do_padrao'])
     if fora_do_padrao and modo != '1':
         print(f"⚠ {fora_do_padrao} arquivo(s) com nome fora do padrão PREFIXO_AAAAMMDD_HHMMSS: "
               "a data será ajustada, mas o nome não será alterado.")
     print("=" * 60)
 
-def executar_plano(plano, pasta_historico, modo):
-    # 1. Aplica as datas, guardando as originais para o "Desfazer"
+def executar_plano(plano, pasta_historico, modo, gravar_metadados=False):
+    # 0. Guarda as datas originais para o "Desfazer" (antes do exiftool, que recria o arquivo)
+    for item in plano:
+        info = os.stat(item['caminho'])
+        item['original'] = {'criacao': getattr(info, 'st_birthtime', info.st_mtime),
+                            'modificacao': info.st_mtime}
+
+    # 1. Metadados internos (EXIF/vídeo), se pedido
+    if gravar_metadados:
+        suportados = [i for i in plano if suporta_metadados(i['caminho'])]
+        print(f"Gravando metadados internos em {len(suportados)} arquivo(s)...")
+        originais = ler_tags_internas([i['caminho'] for i in suportados])
+        alteracoes = {}
+        for item in suportados:
+            tags_originais = originais.get(item['caminho'], {})
+            novos = novos_valores_internos(item['caminho'], item['dt'], tags_originais)
+            if novos:
+                alteracoes[item['caminho']] = novos
+                # Para desfazer: valor original de cada campo (None = não existia)
+                item['metadados_original'] = {t: tags_originais.get(t) for t in novos}
+        falhas = gravar_tags_internas(alteracoes)
+        for item in suportados:
+            if item['caminho'] in falhas:
+                item.pop('metadados_original', None)
+                print(f"⚠ Metadados internos não gravados: {os.path.basename(item['caminho'])}")
+        print()
+
+    # 2. Aplica as datas do sistema de arquivos
     com_data_ok = []
     for item in plano:
         try:
-            info = os.stat(item['caminho'])
-            item['original'] = {'criacao': getattr(info, 'st_birthtime', info.st_mtime),
-                                'modificacao': info.st_mtime}
             aplicar_datas(item['caminho'], item['dt'])
             com_data_ok.append(item)
         except subprocess.CalledProcessError as e:
@@ -302,20 +418,22 @@ def executar_plano(plano, pasta_historico, modo):
     if len(com_data_ok) != len(plano):
         resolver_nomes_finais(com_data_ok)
 
-    # 2. Renomeia em duas fases
+    # 3. Renomeia em duas fases
     a_renomear = [i for i in com_data_ok if i['nome_final']]
     renomeados = renomear_em_duas_fases(a_renomear)
 
     for item in com_data_ok:
         nome_antigo = os.path.basename(item['caminho'])
+        extra = " (+ metadados internos)" if item.get('metadados_original') else ""
         if item.get('renomeado'):
-            print(f"✓ Corrigido e Renomeado: {nome_antigo} -> {item['nome_final']}")
+            print(f"✓ Corrigido e Renomeado: {nome_antigo} -> {item['nome_final']}{extra}")
         elif not item['nome_final']:
-            print(f"✓ Corrigido: {nome_antigo} -> {item['dt'].strftime(FORMATO_DATA_HORA)}")
+            print(f"✓ Corrigido: {nome_antigo} -> {item['dt'].strftime(FORMATO_DATA_HORA)}{extra}")
         else:
             print(f"⚠ Data corrigida, mas não renomeado: {nome_antigo}")
 
-    registrar_execucao(pasta_historico, modo, com_data_ok)
+    alterados = com_data_ok + [i for i in plano if i not in com_data_ok and i.get('metadados_original')]
+    registrar_execucao(pasta_historico, modo, alterados)
     return len(com_data_ok)
 
 def carregar_historico(pasta):
@@ -347,6 +465,7 @@ def registrar_execucao(pasta, modo, itens):
             'nome_novo': item['nome_final'] if item.get('renomeado') else None,
             'criacao': item['original']['criacao'],
             'modificacao': item['original']['modificacao'],
+            'metadados': item.get('metadados_original'),
         })
     try:
         execucoes = carregar_historico(pasta)
@@ -401,7 +520,8 @@ def desfazer_ultima_execucao(pasta):
         destino = f" -> {item['nome_final']}" if item['nome_final'] else ""
         criacao = datetime.fromtimestamp(reg['criacao']).strftime(FORMATO_DATA_HORA)
         modificacao = datetime.fromtimestamp(reg['modificacao']).strftime(FORMATO_DATA_HORA)
-        print(f"  {nome}{destino}  [criação {criacao} | modificação {modificacao}]")
+        meta = " + metadados internos" if reg.get('metadados') else ""
+        print(f"  {nome}{destino}  [criação {criacao} | modificação {modificacao}{meta}]")
     if len(itens) > LIMITE_PREVIA:
         print(f"  ... e mais {len(itens) - LIMITE_PREVIA} arquivo(s)")
     print("=" * 60)
@@ -415,6 +535,21 @@ def desfazer_ultima_execucao(pasta):
     try:
         falhas = []
         restaurados = []
+
+        # Metadados internos primeiro (o exiftool recria o arquivo e altera as datas)
+        com_metadados = {i['caminho']: i['registro']['metadados'] for i in itens
+                         if i['registro'].get('metadados')}
+        if com_metadados:
+            if not shutil.which("exiftool"):
+                print("Erro: exiftool necessário para restaurar os metadados internos.")
+                return 0
+            falhas_meta = gravar_tags_internas(com_metadados)
+            for item in itens:
+                if item['caminho'] in falhas_meta:
+                    falhas.append(item['registro'])  # fica no histórico para nova tentativa
+                    print(f"⚠ Metadados internos não restaurados: {os.path.basename(item['caminho'])}")
+            itens = [i for i in itens if i['caminho'] not in falhas_meta]
+
         for item in itens:
             reg = item['registro']
             try:
@@ -655,6 +790,19 @@ def main():
 
     parametros.update(valor_manual=valor_manual, deslocamento_horas=deslocamento_horas,
                       data_fixa_dma=data_fixa_dma)
+
+    videos_img = [a for a in arquivos if eh_video(a) and os.path.basename(a).startswith("IMG_")]
+    if videos_img:
+        resposta = input(f"\n{len(videos_img)} vídeo(s) com prefixo IMG_. Renomear para VID_? (s/N): ")
+        parametros['prefixo_vid'] = resposta.strip().lower() in ('s', 'sim')
+
+    gravar_metadados = False
+    if shutil.which("exiftool") and any(suporta_metadados(a) for a in arquivos):
+        print("\nOs metadados internos (EXIF das fotos, datas dos vídeos) são o que apps como")
+        print("Fotos, Lightroom e Insta360 Studio exibem. Gravá-los ALTERA O CONTEÚDO dos arquivos")
+        print("(reversível pelo modo 6).")
+        resposta = input("Gravar a nova data também nos metadados internos? (s/N): ")
+        gravar_metadados = resposta.strip().lower() in ('s', 'sim')
     total_arquivos = len(arquivos)
     plano = montar_plano(arquivos, opcao, parametros)
 
@@ -662,14 +810,14 @@ def main():
     if not plano:
         print("\nNenhum arquivo a alterar.")
     else:
-        exibir_previa(plano, caminho_alvo, opcao)
+        exibir_previa(plano, caminho_alvo, opcao, gravar_metadados)
         confirmacao = input("Confirmar as alterações? (s/N): ").strip().lower()
         if confirmacao in ('s', 'sim'):
             print()
             # Ctrl+C no meio da renomeação deixaria arquivos com nome temporário
             sigint_anterior = signal.signal(signal.SIGINT, signal.SIG_IGN)
             try:
-                sucessos = executar_plano(plano, pasta_historico, opcao)
+                sucessos = executar_plano(plano, pasta_historico, opcao, gravar_metadados)
             finally:
                 signal.signal(signal.SIGINT, sigint_anterior)
         else:

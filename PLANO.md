@@ -16,8 +16,8 @@ Legenda: [ ] pendente · [x] concluído
 - [x] 2.3 Modo 5: escolher o arquivo de referência
 
 ## Fase 3 — Funcionalidades
-- [ ] 3.1 Corrigir EXIF/metadados de vídeo com exiftool (opcional nos modos 3, 4 e 5)
-- [ ] 3.2 Prefixo `VID_` para vídeos
+- [x] 3.1 Corrigir EXIF/metadados de vídeo com exiftool (opcional nos modos 3, 4 e 5)
+- [x] 3.2 Prefixo `VID_` para vídeos
 - [ ] 3.3 Argumentos de linha de comando (`--modo`, `--filtro`, `--dry-run`, `--sim`)
 - [ ] 3.4 Detecção automática do fuso da câmera por pares foto/vídeo
 

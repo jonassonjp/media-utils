@@ -8,7 +8,7 @@ Resolve problemas comuns como:
 - câmera com o relógio errado (ex: fotos datadas de 2018 por falta de configuração);
 - data de modificação igual ao dia em que os arquivos foram copiados.
 
-> ⚠️ O script altera **apenas as datas do sistema de arquivos e o nome**. Os metadados internos (EXIF das fotos, data dos vídeos) **não são modificados** — apps como Fotos e Lightroom continuam lendo a data gravada pela câmera.
+> ⚠️ Por padrão o script altera **apenas as datas do sistema de arquivos e o nome**. Os metadados internos (EXIF das fotos, datas dos vídeos), que apps como Fotos, Lightroom e Insta360 Studio exibem, só são alterados se você responder **s** à pergunta correspondente (requer `exiftool`). Veja [Metadados internos](#-metadados-internos-exifvídeo).
 
 ---
 
@@ -19,7 +19,7 @@ Resolve problemas comuns como:
 | **macOS** | Datas de criação são um recurso do macOS | — |
 | **Python 3** | Executar o script | Já vem com as Xcode Command Line Tools |
 | **SetFile** | Alterar a data de criação | `xcode-select --install` |
-| **exiftool** *(opcional)* | Apenas para o modo 5 | `brew install exiftool` |
+| **exiftool** *(opcional)* | Modo 5 e gravação dos metadados internos | `brew install exiftool` |
 
 O script verifica se o `SetFile` está instalado antes de começar.
 
@@ -39,8 +39,11 @@ O fluxo é interativo:
 
 1. **Filtro de extensão** (só para pastas): ex. `dng`, `.insp` ou `*.mp4`. Em branco processa todos. Não diferencia maiúsculas (`dng` encontra `.DNG`).
 2. **Escolha do modo** (veja abaixo).
-3. **Prévia** das alterações: nome atual → nome novo e a data que será aplicada.
-4. **Confirmação** (`s/N`). Nada é alterado se você não confirmar.
+3. Perguntas extras, quando se aplicam:
+   - vídeos com prefixo `IMG_`: renomear para `VID_`?
+   - gravar a nova data também nos **metadados internos**?
+4. **Prévia** das alterações: nome atual → nome novo e a data que será aplicada.
+5. **Confirmação** (`s/N`). Nada é alterado se você não confirmar.
 
 Pastas são processadas **recursivamente**. Arquivos e pastas ocultos (`.Trashes`, `.Spotlight-V100`, `._*` etc.) são ignorados.
 
@@ -76,6 +79,23 @@ Nos modos 2 a 5, se o nome seguir o padrão, ele é **renomeado** para a nova da
 IMG_20181002_013201_003.dng -> IMG_20261108_093201_003.dng  [08/11/2026 09:32:01]
 VID_20181002_020751_015.mp4 -> VID_20261108_110751_015.mp4  [08/11/2026 11:07:51]
 ```
+
+---
+
+## 🏷️ Metadados internos (EXIF/vídeo)
+
+Opcional em todos os modos (1 a 5), com `exiftool` instalado. Grava a nova data dentro do arquivo:
+
+| Tipo | Extensões | Campos gravados |
+|---|---|---|
+| Fotos | `.jpg`, `.jpeg`, `.insp`, `.dng`, `.heic` | `DateTimeOriginal`, `CreateDate`, `ModifyDate` (hora local) |
+| Vídeos | `.mp4`, `.mov`, `.insv`, `.lrv`, `.m4v` | Todas as datas QuickTime, inclusive de cada trilha (em **UTC**, como a especificação exige; campos com fuso explícito recebem a hora local com fuso) |
+
+- Altera o **conteúdo** dos arquivos. É reversível pelo modo 6, mas mantenha uma cópia de segurança.
+- Outras extensões têm só as datas do sistema de arquivos ajustadas.
+- O script confere os valores gravados e avisa se algum arquivo falhou.
+
+**Exemplo:** para corrigir o EXIF de fotos que já têm o nome certo, use o **modo 1** e responda **s** na pergunta dos metadados.
 
 ---
 
