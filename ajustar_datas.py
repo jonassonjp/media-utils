@@ -4,6 +4,7 @@ import sys
 import re
 import json
 import shutil
+import signal
 import subprocess
 import fnmatch
 from collections import defaultdict
@@ -23,6 +24,10 @@ TAG_VIDEO = "QuickTime:CreateDate"
 # Medido na Insta360 Ace Pro 2 (fotos = vídeos + 1h).
 FUSO_CAMERA_PADRAO = 1
 
+# Nome renomeável: PREFIXO_AAAAMMDD_HHMMSS seguido de "_", "." ou fim do nome.
+# Aceita hora com 5 dígitos (nomes editados à mão, ex: IMG_20261108_09319_001.mp4).
+PADRAO_NOME_RENOMEAVEL = re.compile(r"^(" + PREFIXOS + r")_\d{8}_\d{5,6}(?=[_.]|$)(.*)$")
+
 def extrair_data_nome(arquivo):
     """Tenta extrair a data do padrão de nome IMG_YYYYMMDD_HHMMSS (ou VID_/LRV_)"""
     padrao = re.compile(PREFIXOS + r"_(\d{8})_(\d{6})")
@@ -36,24 +41,20 @@ def extrair_data_nome(arquivo):
     return None
 
 def obter_data_criacao_mac(caminho):
-    """Obtém a data de criação atual do arquivo no Mac via stat (Hora do Sistema)"""
-    try:
-        resultado = subprocess.run(["stat", "-f", "%B", caminho], capture_output=True, text=True, check=True)
-        timestamp = int(resultado.stdout.strip())
-        return datetime.fromtimestamp(timestamp)
-    except Exception:
-        return datetime.fromtimestamp(os.path.getmtime(caminho))
+    """Obtém a data de criação atual do arquivo (na falta dela, a de modificação)"""
+    info = os.stat(caminho)
+    return datetime.fromtimestamp(getattr(info, "st_birthtime", info.st_mtime))
 
 def aplicar_datas(caminho, dt):
     """Aplica a data e hora informada como data de Criação e Modificação no macOS"""
-    formato_touch = dt.strftime("%Y%m%d%H%M.%S")
     formato_setfile = dt.strftime("%m/%d/%Y %H:%M:%S")
 
     # 1. Atualiza data de Criação (exclusivo macOS, requer Xcode Command Line Tools)
     subprocess.run(["SetFile", "-d", formato_setfile, caminho], check=True, capture_output=True, text=True)
     # 2. Atualiza data de Modificação POR ÚLTIMO: em volumes exFAT (cartões SD, discos
     #    externos) o SetFile redefine a modificação para a hora atual.
-    subprocess.run(["touch", "-t", formato_touch, caminho], check=True, capture_output=True, text=True)
+    timestamp = dt.timestamp()
+    os.utime(caminho, (timestamp, timestamp))
 
     # 3. Confere se a data de modificação foi gravada (tolerância de 2s do FAT32)
     if abs(os.path.getmtime(caminho) - dt.timestamp()) > 2:
@@ -143,10 +144,9 @@ def calcular_data(caminho, modo, parametros):
 def nome_desejado_por_data(nome_antigo, nova_dt):
     """
     Se o nome seguir o padrão, retorna o novo nome com a data/hora atualizada (ou None).
-    Aceita hora com 5 dígitos (nomes editados à mão, ex: IMG_20261108_09319_001.mp4),
-    que é substituída pela hora correta com 6 dígitos.
+    Hora com 5 dígitos é substituída pela hora correta com 6 dígitos.
     """
-    match = re.match(r"^(" + PREFIXOS + r")_\d{8}_\d{5,6}(?=[_.]|$)(.*)$", nome_antigo)
+    match = PADRAO_NOME_RENOMEAVEL.match(nome_antigo)
     if not match:
         return None
     novo_nome = f"{match.group(1)}_{nova_dt.strftime('%Y%m%d_%H%M%S')}{match.group(2)}"
@@ -241,11 +241,12 @@ def montar_plano(arquivos, modo, parametros):
             else:
                 print(f"✗ Ignorado: Padrão de data não encontrado no nome de '{nome}'")
             continue
-        plano.append({'caminho': caminho, 'dt': dt, 'nome_desejado': nome_desejado_por_data(nome, dt)})
+        plano.append({'caminho': caminho, 'dt': dt, 'nome_desejado': nome_desejado_por_data(nome, dt),
+                      'fora_do_padrao': not PADRAO_NOME_RENOMEAVEL.match(nome)})
     resolver_nomes_finais(plano)
     return plano
 
-def exibir_previa(plano, caminho_alvo):
+def exibir_previa(plano, caminho_alvo, modo):
     print("\n" + "=" * 60)
     print("  PRÉVIA DAS ALTERAÇÕES")
     print("=" * 60)
@@ -255,6 +256,8 @@ def exibir_previa(plano, caminho_alvo):
         data = item['dt'].strftime('%d/%m/%Y %H:%M:%S')
         if item['nome_final']:
             print(f"  {nome} -> {item['nome_final']}  [{data}]")
+        elif item['fora_do_padrao'] and modo != '1':
+            print(f"  {nome}  [{data}]  (nome fora do padrão: não será renomeado)")
         else:
             print(f"  {nome}  [{data}]")
     if len(plano) > LIMITE_PREVIA:
@@ -262,6 +265,10 @@ def exibir_previa(plano, caminho_alvo):
     renomeacoes = sum(1 for i in plano if i['nome_final'])
     print("-" * 60)
     print(f"Arquivos com data alterada: {len(plano)} | Arquivos renomeados: {renomeacoes}")
+    fora_do_padrao = sum(1 for i in plano if i['fora_do_padrao'])
+    if fora_do_padrao and modo != '1':
+        print(f"⚠ {fora_do_padrao} arquivo(s) com nome fora do padrão PREFIXO_AAAAMMDD_HHMMSS: "
+              "a data será ajustada, mas o nome não será alterado.")
     print("=" * 60)
 
 def executar_plano(plano):
@@ -384,7 +391,11 @@ def main():
         print("  xcode-select --install")
         sys.exit(1)
 
-    caminho_alvo = sys.argv[1].strip()
+    # Usa o caminho exato; só remove espaços/quebras das pontas se o exato não existir
+    # (nomes de pasta podem terminar com espaço)
+    caminho_alvo = sys.argv[1]
+    if not os.path.exists(caminho_alvo) and os.path.exists(caminho_alvo.strip()):
+        caminho_alvo = caminho_alvo.strip()
 
     if not os.path.exists(caminho_alvo):
         print(f"Erro: O caminho fornecido não existe: '{caminho_alvo}'")
@@ -458,10 +469,7 @@ def main():
         while True:
             desloc_input = input("Digite o deslocamento de horas (Ex: +1, -3): ").strip()
             try:
-                if  desloc_input.startswith('+'):
-                    deslocamento_horas = int(desloc_input[1:])
-                else:
-                    deslocamento_horas = int(desloc_input)
+                deslocamento_horas = int(desloc_input)  # int() já aceita "+1" e "-3"
                 break
             except ValueError:
                 print("Valor inválido! Digite um número inteiro.")
@@ -488,11 +496,16 @@ def main():
     if not plano:
         print("\nNenhum arquivo a alterar.")
     else:
-        exibir_previa(plano, caminho_alvo)
+        exibir_previa(plano, caminho_alvo, opcao)
         confirmacao = input("Confirmar as alterações? (s/N): ").strip().lower()
         if confirmacao in ('s', 'sim'):
             print()
-            sucessos = executar_plano(plano)
+            # Ctrl+C no meio da renomeação deixaria arquivos com nome temporário
+            sigint_anterior = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                sucessos = executar_plano(plano)
+            finally:
+                signal.signal(signal.SIGINT, sigint_anterior)
         else:
             print("\nOperação cancelada. Nenhum arquivo foi alterado.")
 
@@ -504,4 +517,8 @@ def main():
     print("=" * 40)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print("\n\nOperação interrompida. Nenhum arquivo foi alterado.")
+        sys.exit(130)

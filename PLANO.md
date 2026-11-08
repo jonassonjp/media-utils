@@ -3,12 +3,12 @@
 Legenda: [ ] pendente · [x] concluído
 
 ## Fase 1 — Robustez e limpeza
-- [ ] 1.1 Saída amigável em Ctrl+C / Ctrl+D
-- [ ] 1.2 `os.stat().st_birthtime` e `os.utime` no lugar de `stat`/`touch` via subprocess
-- [ ] 1.3 Remover código morto (tratamento do `+` no modo 3, filtro de arquivo único)
-- [ ] 1.4 Não usar `.strip()` no caminho (só remover a quebra de linha do arrastar e soltar)
-- [ ] 1.5 Avisar quando a data é ajustada mas o arquivo não é renomeado (nome fora do padrão)
-- [ ] 1.6 `.gitignore` (`__pycache__`, `.DS_Store`)
+- [x] 1.1 Saída amigável em Ctrl+C / Ctrl+D
+- [x] 1.2 `os.stat().st_birthtime` e `os.utime` no lugar de `stat`/`touch` via subprocess
+- [x] 1.3 Remover código morto (tratamento do `+` no modo 3, filtro de arquivo único)
+- [x] 1.4 Não usar `.strip()` no caminho (só remover a quebra de linha do arrastar e soltar)
+- [x] 1.5 Avisar quando a data é ajustada mas o arquivo não é renomeado (nome fora do padrão)
+- [x] 1.6 `.gitignore` (`__pycache__`, `.DS_Store`)
 
 ## Fase 2 — Segurança dos dados
 - [ ] 2.1 Registro para desfazer (`.json` com nomes e datas antigos) + modo "Desfazer"
