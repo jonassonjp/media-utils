@@ -77,9 +77,17 @@ def processar_arquivo(caminho, modo, valor_manual=None, deslocamento_horas=None,
         dt_atual = obter_data_criacao_mac(caminho)
         dt = dt_atual + timedelta(hours=deslocamento_horas)
     elif modo == '4':
-        dt_sistema = obter_data_criacao_mac(caminho)
-        dt = datetime(data_fixa_dma.year, data_fixa_dma.month, data_fixa_dma.day, 
-                      dt_sistema.hour, dt_sistema.minute, dt_sistema.second)
+        # Preserva a HORA original do arquivo, trocando apenas o dia/mês/ano.
+        # Prioridade: hora gravada no NOME (IMG_YYYYMMDD_HHMMSS), que é a da captura.
+        # Sem padrão no nome: usa a mais antiga entre criação e modificação, pois
+        # cópias sem preservar metadados atualizam essas datas para a hora da cópia.
+        dt_origem = extrair_data_nome(nome_arquivo)
+        if not dt_origem:
+            dt_criacao = obter_data_criacao_mac(caminho)
+            dt_modificacao = datetime.fromtimestamp(os.path.getmtime(caminho))
+            dt_origem = min(dt_criacao, dt_modificacao)
+        dt = dt_origem.replace(year=data_fixa_dma.year, month=data_fixa_dma.month,
+                               day=data_fixa_dma.day)
     else:
         return False
 
@@ -142,7 +150,7 @@ def main():
     else:
         print("2. [Indisponível para pastas] Informar uma data e hora MANUALMENTE")
     print("3. Aplicar um DESLOCAMENTO de horas (Ex: +1, -4)")
-    print("4. Alterar apenas a DATA (Manter a HORA do sistema do Mac)")
+    print("4. Alterar apenas a DATA (Manter a HORA original do arquivo)")
     print("-" * 60)
     print("0. Sair (Não fazer nada)")
     print("=" * 60)
