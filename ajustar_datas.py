@@ -2,6 +2,7 @@
 import os
 import sys
 import re
+import json
 import shutil
 import subprocess
 import fnmatch
@@ -10,9 +11,21 @@ from datetime import datetime, timedelta
 
 LIMITE_PREVIA = 20
 
+# Prefixos usados pelas câmeras Insta360 (foto, vídeo e vídeo de baixa resolução)
+PREFIXOS = r"(?:IMG|VID|LRV)"
+
+# Campos de data gravados pela câmera, em ordem de prioridade.
+# Fotos (JPG/INSP/DNG) gravam a hora LOCAL da câmera; o DNG da Ace Pro 2 só tem IFD0:ModifyDate.
+TAGS_FOTO = ["ExifIFD:DateTimeOriginal", "ExifIFD:CreateDate", "IFD0:ModifyDate"]
+# Vídeos (MP4/INSV) gravam em UTC, conforme a especificação QuickTime.
+TAG_VIDEO = "QuickTime:CreateDate"
+# Fuso da câmera em relação ao UTC: diferença entre a hora das fotos e dos vídeos.
+# Medido na Insta360 Ace Pro 2 (fotos = vídeos + 1h).
+FUSO_CAMERA_PADRAO = 1
+
 def extrair_data_nome(arquivo):
-    """Tenta extrair a data do padrão de nome IMG_YYYYMMDD_HHMMSS"""
-    padrao = re.compile(r"IMG_(\d{8})_(\d{6})")
+    """Tenta extrair a data do padrão de nome IMG_YYYYMMDD_HHMMSS (ou VID_/LRV_)"""
+    padrao = re.compile(PREFIXOS + r"_(\d{8})_(\d{6})")
     match = padrao.search(arquivo)
     if match:
         data_str, hora_str = match.group(1), match.group(2)
@@ -46,17 +59,74 @@ def aplicar_datas(caminho, dt):
     if abs(os.path.getmtime(caminho) - dt.timestamp()) > 2:
         raise OSError("a data de modificação não foi gravada pelo sistema de arquivos")
 
-def calcular_data(caminho, modo, valor_manual=None, deslocamento_horas=None, data_fixa_dma=None):
+def converter_data_exif(valor):
+    """Converte 'AAAA:MM:DD HH:MM:SS[...]' em datetime (None se vazio ou zerado)"""
+    try:
+        return datetime.strptime(str(valor)[:19], "%Y:%m:%d %H:%M:%S")
+    except ValueError:
+        return None
+
+def ler_metadados(caminhos):
+    """
+    Lê com o exiftool a data gravada pela câmera em cada arquivo.
+    Retorna {caminho: (datetime, eh_video)}; arquivos sem data ficam de fora.
+    """
+    if not caminhos:
+        return {}
+    comando = ["exiftool", "-json", "-G1", "-q", "-q", "-charset", "filename=utf8"]
+    comando += [f"-{tag}" for tag in TAGS_FOTO + [TAG_VIDEO]]
+    comando += ["-@", "-"]  # lista de arquivos pela entrada padrão
+    resultado = subprocess.run(comando, input="\n".join(caminhos), capture_output=True, text=True)
+    try:
+        itens = json.loads(resultado.stdout or "[]")
+    except json.JSONDecodeError:
+        print(f"Erro ao ler a saída do exiftool: {resultado.stderr.strip()}")
+        return {}
+
+    metadados = {}
+    for item in itens:
+        caminho = item.get("SourceFile")
+        for tag in TAGS_FOTO:
+            dt = converter_data_exif(item.get(tag, ""))
+            if dt:
+                metadados[caminho] = (dt, False)
+                break
+        else:
+            dt = converter_data_exif(item.get(TAG_VIDEO, ""))
+            if dt:
+                metadados[caminho] = (dt, True)
+    return metadados
+
+def hora_camera(info, fuso_camera):
+    """Hora no relógio da câmera: vídeos (UTC) recebem o fuso para ficarem iguais às fotos"""
+    dt, eh_video = info
+    return dt + timedelta(hours=fuso_camera) if eh_video else dt
+
+def formatar_correcao(delta):
+    sinal = "-" if delta < timedelta(0) else "+"
+    total = abs(int(delta.total_seconds()))
+    dias, resto = divmod(total, 86400)
+    horas, resto = divmod(resto, 3600)
+    minutos, segundos = divmod(resto, 60)
+    return f"{sinal}{dias} dia(s) {horas:02d}:{minutos:02d}:{segundos:02d}"
+
+def calcular_data(caminho, modo, parametros):
     """Calcula a nova data do arquivo conforme o modo. Retorna None se não for possível."""
     nome_arquivo = os.path.basename(caminho)
 
     if modo == '1':
         return extrair_data_nome(nome_arquivo)
     if modo == '2':
-        return valor_manual
+        return parametros['valor_manual']
     if modo == '3':
-        return obter_data_criacao_mac(caminho) + timedelta(hours=deslocamento_horas)
+        return obter_data_criacao_mac(caminho) + timedelta(hours=parametros['deslocamento_horas'])
+    if modo == '5':
+        info = parametros['metadados'].get(caminho)
+        if not info:
+            return None
+        return hora_camera(info, parametros['fuso_camera']) + parametros['correcao']
     if modo == '4':
+        data_fixa_dma = parametros['data_fixa_dma']
         # Preserva a HORA original do arquivo, trocando apenas o dia/mês/ano.
         # Prioridade: hora gravada no NOME (IMG_YYYYMMDD_HHMMSS), que é a da captura.
         # Sem padrão no nome: usa a mais antiga entre criação e modificação, pois
@@ -71,11 +141,15 @@ def calcular_data(caminho, modo, valor_manual=None, deslocamento_horas=None, dat
     return None
 
 def nome_desejado_por_data(nome_antigo, nova_dt):
-    """Se o nome seguir o padrão, retorna o novo nome com a data/hora atualizada (ou None)"""
-    match = re.match(r"^IMG_\d{8}_\d{6}(.*)$", nome_antigo)
+    """
+    Se o nome seguir o padrão, retorna o novo nome com a data/hora atualizada (ou None).
+    Aceita hora com 5 dígitos (nomes editados à mão, ex: IMG_20261108_09319_001.mp4),
+    que é substituída pela hora correta com 6 dígitos.
+    """
+    match = re.match(r"^(" + PREFIXOS + r")_\d{8}_\d{5,6}(?=[_.]|$)(.*)$", nome_antigo)
     if not match:
         return None
-    novo_nome = f"{nova_dt.strftime('IMG_%Y%m%d_%H%M%S')}{match.group(1)}"
+    novo_nome = f"{match.group(1)}_{nova_dt.strftime('%Y%m%d_%H%M%S')}{match.group(2)}"
     return novo_nome if novo_nome != nome_antigo else None
 
 def adicionar_sufixo(nome, contador):
@@ -152,17 +226,20 @@ def renomear_em_duas_fases(itens):
             print(f"✗ Erro ao renomear {os.path.basename(item['caminho'])}: {e}")
     return renomeados
 
-def montar_plano(arquivos, modo, valor_manual, deslocamento_horas, data_fixa_dma):
+def montar_plano(arquivos, modo, parametros):
     plano = []
     for caminho in arquivos:
         nome = os.path.basename(caminho)
         try:
-            dt = calcular_data(caminho, modo, valor_manual, deslocamento_horas, data_fixa_dma)
+            dt = calcular_data(caminho, modo, parametros)
         except (OSError, ValueError) as e:
             print(f"✗ Ignorado: não foi possível calcular a data de '{nome}': {e}")
             continue
         if not dt:
-            print(f"✗ Ignorado: Padrão de data não encontrado no nome de '{nome}'")
+            if modo == '5':
+                print(f"✗ Ignorado: Data não encontrada nos metadados de '{nome}'")
+            else:
+                print(f"✗ Ignorado: Padrão de data não encontrado no nome de '{nome}'")
             continue
         plano.append({'caminho': caminho, 'dt': dt, 'nome_desejado': nome_desejado_por_data(nome, dt)})
     resolver_nomes_finais(plano)
@@ -234,6 +311,66 @@ def listar_arquivos(caminho_alvo, mascara):
                 arquivos_encontrados.append(os.path.join(raiz, arquivo))
     return arquivos_encontrados
 
+def configurar_modo_metadados(arquivos):
+    """
+    Modo 5: lê as datas gravadas pela câmera e calcula a correção do relógio a partir
+    da data/hora REAL de um arquivo de referência (o mais antigo do lote).
+    """
+    if not shutil.which("exiftool"):
+        print("Erro: o comando 'exiftool' não foi encontrado. Instale com:")
+        print("  brew install exiftool")
+        sys.exit(1)
+
+    print(f"\nLendo metadados de {len(arquivos)} arquivo(s)...")
+    metadados = ler_metadados(arquivos)
+    if not metadados:
+        print("Nenhum arquivo com data nos metadados. Saindo.")
+        sys.exit(1)
+
+    qtd_videos = sum(1 for _, eh_video in metadados.values() if eh_video)
+    qtd_fotos = len(metadados) - qtd_videos
+    print(f"Datas encontradas: {qtd_fotos} foto(s), {qtd_videos} vídeo(s).")
+
+    fuso_camera = 0
+    if qtd_videos and qtd_fotos:
+        print("\nVídeos gravam a hora em UTC e fotos na hora local da câmera.")
+        print(f"Na Insta360 Ace Pro 2 a diferença medida foi de {FUSO_CAMERA_PADRAO:+d}h.")
+        while True:
+            fuso_input = input(f"Fuso da câmera em horas (Enter = {FUSO_CAMERA_PADRAO:+d}): ").strip()
+            if not fuso_input:
+                fuso_camera = FUSO_CAMERA_PADRAO
+                break
+            try:
+                fuso_camera = int(fuso_input)
+                break
+            except ValueError:
+                print("Valor inválido! Digite um número inteiro (Ex: +1, -3).")
+
+    referencia = min(metadados, key=lambda c: hora_camera(metadados[c], fuso_camera))
+    dt_ref_camera = hora_camera(metadados[referencia], fuso_camera)
+    dt_ref_nome = extrair_data_nome(os.path.basename(referencia))
+
+    print("\nArquivo de referência (o mais antigo do lote):")
+    print(f"  {os.path.basename(referencia)}")
+    print(f"  Hora no relógio da câmera: {dt_ref_camera.strftime('%d/%m/%Y %H:%M:%S')}")
+    dica = ""
+    if dt_ref_nome and dt_ref_nome != dt_ref_camera:
+        dica = f" ou Enter para usar a do nome ({dt_ref_nome.strftime('%d/%m/%Y %H:%M:%S')})"
+    while True:
+        data_input = input(f"Digite a data/hora REAL deste arquivo (DD/MM/AAAA HH:MM:SS){dica}: ").strip()
+        if not data_input and dica:
+            dt_ref_real = dt_ref_nome
+            break
+        try:
+            dt_ref_real = datetime.strptime(data_input, "%d/%m/%Y %H:%M:%S")
+            break
+        except ValueError:
+            print("Formato inválido! Tente novamente.")
+
+    correcao = dt_ref_real - dt_ref_camera
+    print(f"Correção do relógio aplicada a todos os arquivos: {formatar_correcao(correcao)}")
+    return {'metadados': metadados, 'fuso_camera': fuso_camera, 'correcao': correcao}
+
 def main():
     if len(sys.argv) < 2:
         print("Erro: Você precisa passar o caminho de um arquivo ou diretório como parâmetro.")
@@ -286,6 +423,7 @@ def main():
         print("2. [Indisponível para pastas] Informar uma data e hora MANUALMENTE")
     print("3. Aplicar um DESLOCAMENTO de horas (Ex: +1, -4)")
     print("4. Alterar apenas a DATA (Manter a HORA original do arquivo)")
+    print("5. Usar a data dos METADADOS da câmera + correção do relógio (requer exiftool)")
     print("-" * 60)
     print("0. Sair (Não fazer nada)")
     print("=" * 60)
@@ -299,6 +437,9 @@ def main():
     valor_manual = None
     deslocamento_horas = None
     data_fixa_dma = None
+    parametros = {}
+
+    arquivos = listar_arquivos(caminho_alvo, mascara)
 
     if opcao == '1':
         print("\nModo: Extração automática pelo nome do arquivo.\n")
@@ -332,13 +473,16 @@ def main():
                 break
             except ValueError:
                 print("Formato inválido! Use barras e 4 dígitos para o ano (Ex: 08/06/2026).")
+    elif opcao == '5':
+        parametros.update(configurar_modo_metadados(arquivos))
     else:
         print("Opção inválida. Saindo.")
         sys.exit(1)
 
-    arquivos = listar_arquivos(caminho_alvo, mascara)
+    parametros.update(valor_manual=valor_manual, deslocamento_horas=deslocamento_horas,
+                      data_fixa_dma=data_fixa_dma)
     total_arquivos = len(arquivos)
-    plano = montar_plano(arquivos, opcao, valor_manual, deslocamento_horas, data_fixa_dma)
+    plano = montar_plano(arquivos, opcao, parametros)
 
     sucessos = 0
     if not plano:
