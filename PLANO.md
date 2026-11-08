@@ -11,9 +11,9 @@ Legenda: [ ] pendente · [x] concluído
 - [x] 1.6 `.gitignore` (`__pycache__`, `.DS_Store`)
 
 ## Fase 2 — Segurança dos dados
-- [ ] 2.1 Registro para desfazer (`.json` com nomes e datas antigos) + modo "Desfazer"
-- [ ] 2.2 Modo 3: aviso de efeito cumulativo e opção de usar a hora do nome como base
-- [ ] 2.3 Modo 5: escolher o arquivo de referência
+- [x] 2.1 Registro para desfazer (`.json` com nomes e datas antigos) + modo "Desfazer"
+- [x] 2.2 Modo 3: aviso de efeito cumulativo e opção de usar a hora do nome como base
+- [x] 2.3 Modo 5: escolher o arquivo de referência
 
 ## Fase 3 — Funcionalidades
 - [ ] 3.1 Corrigir EXIF/metadados de vídeo com exiftool (opcional nos modos 3, 4 e 5)

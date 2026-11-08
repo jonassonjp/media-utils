@@ -12,6 +12,10 @@ from datetime import datetime, timedelta
 
 LIMITE_PREVIA = 20
 
+# Histórico oculto gravado na pasta-alvo, usado pelo modo "Desfazer"
+ARQUIVO_HISTORICO = ".ajustar_datas_historico.json"
+FORMATO_DATA_HORA = "%d/%m/%Y %H:%M:%S"
+
 # Prefixos usados pelas câmeras Insta360 (foto, vídeo e vídeo de baixa resolução)
 PREFIXOS = r"(?:IMG|VID|LRV)"
 
@@ -45,19 +49,22 @@ def obter_data_criacao_mac(caminho):
     info = os.stat(caminho)
     return datetime.fromtimestamp(getattr(info, "st_birthtime", info.st_mtime))
 
-def aplicar_datas(caminho, dt):
-    """Aplica a data e hora informada como data de Criação e Modificação no macOS"""
+def aplicar_datas(caminho, dt, dt_modificacao=None):
+    """
+    Aplica dt como data de Criação e dt_modificacao (padrão: dt) como data de Modificação.
+    """
+    dt_modificacao = dt_modificacao or dt
     formato_setfile = dt.strftime("%m/%d/%Y %H:%M:%S")
 
     # 1. Atualiza data de Criação (exclusivo macOS, requer Xcode Command Line Tools)
     subprocess.run(["SetFile", "-d", formato_setfile, caminho], check=True, capture_output=True, text=True)
     # 2. Atualiza data de Modificação POR ÚLTIMO: em volumes exFAT (cartões SD, discos
     #    externos) o SetFile redefine a modificação para a hora atual.
-    timestamp = dt.timestamp()
+    timestamp = dt_modificacao.timestamp()
     os.utime(caminho, (timestamp, timestamp))
 
     # 3. Confere se a data de modificação foi gravada (tolerância de 2s do FAT32)
-    if abs(os.path.getmtime(caminho) - dt.timestamp()) > 2:
+    if abs(os.path.getmtime(caminho) - timestamp) > 2:
         raise OSError("a data de modificação não foi gravada pelo sistema de arquivos")
 
 def converter_data_exif(valor):
@@ -120,7 +127,10 @@ def calcular_data(caminho, modo, parametros):
     if modo == '2':
         return parametros['valor_manual']
     if modo == '3':
-        return obter_data_criacao_mac(caminho) + timedelta(hours=parametros['deslocamento_horas'])
+        base = extrair_data_nome(nome_arquivo) if parametros.get('base_nome') else None
+        if base is None:
+            base = obter_data_criacao_mac(caminho)
+        return base + timedelta(hours=parametros['deslocamento_horas'])
     if modo == '5':
         info = parametros['metadados'].get(caminho)
         if not info:
@@ -216,6 +226,7 @@ def renomear_em_duas_fases(itens):
         try:
             destino = renomear_sem_sobrescrever(temporario, os.path.join(diretorio, item['nome_final']))
             item['nome_final'] = os.path.basename(destino)
+            item['renomeado'] = True
             renomeados.append(item)
         except OSError as e:
             # Tenta devolver o nome original para não deixar o arquivo com nome temporário
@@ -271,11 +282,14 @@ def exibir_previa(plano, caminho_alvo, modo):
               "a data será ajustada, mas o nome não será alterado.")
     print("=" * 60)
 
-def executar_plano(plano):
-    # 1. Aplica as datas
+def executar_plano(plano, pasta_historico, modo):
+    # 1. Aplica as datas, guardando as originais para o "Desfazer"
     com_data_ok = []
     for item in plano:
         try:
+            info = os.stat(item['caminho'])
+            item['original'] = {'criacao': getattr(info, 'st_birthtime', info.st_mtime),
+                                'modificacao': info.st_mtime}
             aplicar_datas(item['caminho'], item['dt'])
             com_data_ok.append(item)
         except subprocess.CalledProcessError as e:
@@ -294,14 +308,146 @@ def executar_plano(plano):
 
     for item in com_data_ok:
         nome_antigo = os.path.basename(item['caminho'])
-        if item in renomeados:
+        if item.get('renomeado'):
             print(f"✓ Corrigido e Renomeado: {nome_antigo} -> {item['nome_final']}")
-        elif item not in a_renomear:
-            print(f"✓ Corrigido: {nome_antigo} -> {item['dt'].strftime('%d/%m/%Y %H:%M:%S')}")
+        elif not item['nome_final']:
+            print(f"✓ Corrigido: {nome_antigo} -> {item['dt'].strftime(FORMATO_DATA_HORA)}")
         else:
             print(f"⚠ Data corrigida, mas não renomeado: {nome_antigo}")
 
+    registrar_execucao(pasta_historico, modo, com_data_ok)
     return len(com_data_ok)
+
+def carregar_historico(pasta):
+    caminho = os.path.join(pasta, ARQUIVO_HISTORICO)
+    if not os.path.exists(caminho):
+        return []
+    with open(caminho, encoding="utf-8") as f:
+        return json.load(f)
+
+def salvar_historico(pasta, execucoes):
+    caminho = os.path.join(pasta, ARQUIVO_HISTORICO)
+    if not execucoes:
+        if os.path.exists(caminho):
+            os.remove(caminho)
+        return
+    temporario = caminho + ".tmp"
+    with open(temporario, "w", encoding="utf-8") as f:
+        json.dump(execucoes, f, ensure_ascii=False, indent=1)
+    os.replace(temporario, caminho)
+
+def registrar_execucao(pasta, modo, itens):
+    """Grava no histórico o nome e as datas ORIGINAIS de cada arquivo alterado"""
+    if not itens:
+        return
+    registros = []
+    for item in itens:
+        registros.append({
+            'arquivo': os.path.relpath(item['caminho'], pasta),
+            'nome_novo': item['nome_final'] if item.get('renomeado') else None,
+            'criacao': item['original']['criacao'],
+            'modificacao': item['original']['modificacao'],
+        })
+    try:
+        execucoes = carregar_historico(pasta)
+        execucoes.append({'data_execucao': datetime.now().strftime(FORMATO_DATA_HORA),
+                          'modo': modo, 'arquivos': registros})
+        salvar_historico(pasta, execucoes)
+        print(f"\nHistórico salvo: use o modo 6 para desfazer esta execução.")
+    except (OSError, ValueError) as e:
+        print(f"\n⚠ Não foi possível salvar o histórico para desfazer: {e}")
+
+def desfazer_ultima_execucao(pasta):
+    """Modo 6: restaura nomes e datas originais da última execução registrada na pasta"""
+    try:
+        execucoes = carregar_historico(pasta)
+    except (OSError, ValueError) as e:
+        print(f"Erro ao ler o histórico: {e}")
+        return 0
+    if not execucoes:
+        print("\nNenhuma execução registrada nesta pasta.")
+        return 0
+
+    ultima = execucoes[-1]
+    print("\n" + "=" * 60)
+    print("  DESFAZER ÚLTIMA EXECUÇÃO")
+    print("=" * 60)
+    print(f"Executada em {ultima['data_execucao']} (modo {ultima['modo']}), "
+          f"{len(ultima['arquivos'])} arquivo(s).")
+    if len(execucoes) > 1:
+        print(f"Há mais {len(execucoes) - 1} execução(ões) anterior(es) no histórico.")
+
+    itens, nao_encontrados = [], []
+    for registro in ultima['arquivos']:
+        caminho_original = os.path.join(pasta, registro['arquivo'])
+        caminho_atual = caminho_original
+        if registro['nome_novo']:
+            caminho_atual = os.path.join(os.path.dirname(caminho_original), registro['nome_novo'])
+        if not os.path.exists(caminho_atual):
+            nao_encontrados.append(registro)
+            print(f"✗ Não encontrado (movido ou apagado?): {os.path.relpath(caminho_atual, pasta)}")
+            continue
+        itens.append({'caminho': caminho_atual, 'registro': registro,
+                      'nome_final': os.path.basename(caminho_original) if registro['nome_novo'] else None})
+
+    if not itens:
+        print("Nenhum arquivo da última execução foi encontrado.")
+        return 0
+
+    print("-" * 60)
+    for item in itens[:LIMITE_PREVIA]:
+        reg = item['registro']
+        nome = os.path.relpath(item['caminho'], pasta)
+        destino = f" -> {item['nome_final']}" if item['nome_final'] else ""
+        criacao = datetime.fromtimestamp(reg['criacao']).strftime(FORMATO_DATA_HORA)
+        modificacao = datetime.fromtimestamp(reg['modificacao']).strftime(FORMATO_DATA_HORA)
+        print(f"  {nome}{destino}  [criação {criacao} | modificação {modificacao}]")
+    if len(itens) > LIMITE_PREVIA:
+        print(f"  ... e mais {len(itens) - LIMITE_PREVIA} arquivo(s)")
+    print("=" * 60)
+
+    if input("Confirmar a restauração? (s/N): ").strip().lower() not in ('s', 'sim'):
+        print("\nOperação cancelada. Nenhum arquivo foi alterado.")
+        return 0
+    print()
+
+    sigint_anterior = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        falhas = []
+        restaurados = []
+        for item in itens:
+            reg = item['registro']
+            try:
+                aplicar_datas(item['caminho'], datetime.fromtimestamp(reg['criacao']),
+                              datetime.fromtimestamp(reg['modificacao']))
+                restaurados.append(item)
+            except (subprocess.CalledProcessError, OSError) as e:
+                falhas.append(reg)
+                print(f"✗ Erro ao restaurar datas de {os.path.basename(item['caminho'])}: {e}")
+
+        a_renomear = [i for i in restaurados if i['nome_final']]
+        renomear_em_duas_fases(a_renomear)
+        for item in restaurados:
+            nome = os.path.basename(item['caminho'])
+            if item['nome_final'] and not item.get('renomeado'):
+                falhas.append(item['registro'])
+                print(f"⚠ Datas restauradas, mas o nome não: {nome}")
+            elif item.get('renomeado'):
+                print(f"✓ Restaurado: {nome} -> {item['nome_final']}")
+            else:
+                print(f"✓ Restaurado: {nome}")
+
+        # Mantém no histórico só o que não pôde ser desfeito
+        pendentes = falhas + nao_encontrados
+        if pendentes:
+            ultima['arquivos'] = pendentes
+            print(f"\n{len(pendentes)} arquivo(s) continuam no histórico para nova tentativa.")
+        else:
+            execucoes.pop()
+        salvar_historico(pasta, execucoes)
+    finally:
+        signal.signal(signal.SIGINT, sigint_anterior)
+    return len(restaurados)
 
 def listar_arquivos(caminho_alvo, mascara):
     if not os.path.isdir(caminho_alvo):
@@ -354,11 +500,20 @@ def configurar_modo_metadados(arquivos):
                 print("Valor inválido! Digite um número inteiro (Ex: +1, -3).")
 
     referencia = min(metadados, key=lambda c: hora_camera(metadados[c], fuso_camera))
+    print(f"\nArquivo de referência sugerido (o mais antigo do lote): {os.path.basename(referencia)}")
+    por_nome = {os.path.basename(c).lower(): c for c in metadados}
+    while True:
+        escolha = input("Enter para usar este, ou digite o nome de outro arquivo do lote: ").strip()
+        if not escolha:
+            break
+        if escolha.lower() in por_nome:
+            referencia = por_nome[escolha.lower()]
+            break
+        print("Arquivo não encontrado entre os arquivos com data nos metadados. Tente novamente.")
     dt_ref_camera = hora_camera(metadados[referencia], fuso_camera)
     dt_ref_nome = extrair_data_nome(os.path.basename(referencia))
 
-    print("\nArquivo de referência (o mais antigo do lote):")
-    print(f"  {os.path.basename(referencia)}")
+    print(f"\nArquivo de referência: {os.path.basename(referencia)}")
     print(f"  Hora no relógio da câmera: {dt_ref_camera.strftime('%d/%m/%Y %H:%M:%S')}")
     dica = ""
     if dt_ref_nome and dt_ref_nome != dt_ref_camera:
@@ -435,6 +590,7 @@ def main():
     print("3. Aplicar um DESLOCAMENTO de horas (Ex: +1, -4)")
     print("4. Alterar apenas a DATA (Manter a HORA original do arquivo)")
     print("5. Usar a data dos METADADOS da câmera + correção do relógio (requer exiftool)")
+    print("6. DESFAZER a última execução nesta pasta")
     print("-" * 60)
     print("0. Sair (Não fazer nada)")
     print("=" * 60)
@@ -443,6 +599,11 @@ def main():
 
     if opcao == '0':
         print("\nOperação cancelada pelo usuário. Saindo...")
+        sys.exit(0)
+
+    pasta_historico = caminho_alvo if eh_diretorio else os.path.dirname(os.path.abspath(caminho_alvo))
+    if opcao == '6':
+        desfazer_ultima_execucao(pasta_historico)
         sys.exit(0)
 
     valor_manual = None
@@ -466,6 +627,11 @@ def main():
             except ValueError:
                 print("Formato inválido! Tente novamente.")
     elif opcao == '3':
+        print("\nAtenção: o deslocamento é cumulativo. Rodar duas vezes aplica duas vezes.")
+        print("Base do deslocamento:")
+        print("  1. Data de criação atual do arquivo (padrão)")
+        print("  2. Hora do NOME do arquivo (arquivos fora do padrão usam a data de criação)")
+        parametros['base_nome'] = input("Escolha (Enter = 1): ").strip() == '2'
         while True:
             desloc_input = input("Digite o deslocamento de horas (Ex: +1, -3): ").strip()
             try:
@@ -503,7 +669,7 @@ def main():
             # Ctrl+C no meio da renomeação deixaria arquivos com nome temporário
             sigint_anterior = signal.signal(signal.SIGINT, signal.SIG_IGN)
             try:
-                sucessos = executar_plano(plano)
+                sucessos = executar_plano(plano, pasta_historico, opcao)
             finally:
                 signal.signal(signal.SIGINT, sigint_anterior)
         else:

@@ -52,9 +52,10 @@ Pastas são processadas **recursivamente**. Arquivos e pastas ocultos (`.Trashes
 |---|---|---|
 | **1. Data pelo nome** | Lê `IMG_/VID_/LRV_AAAAMMDD_HHMMSS` do nome e aplica nas datas do arquivo. Não renomeia. | Arquivos com nome correto mas datas erradas no Finder |
 | **2. Data manual** | Aplica uma data/hora informada (`DD/MM/AAAA HH:MM:SS`). Só para um arquivo. | Correções pontuais |
-| **3. Deslocamento de horas** | Soma ou subtrai horas (`+1`, `-4`) da data de criação atual. | Erros de fuso horário |
+| **3. Deslocamento de horas** | Soma ou subtrai horas (`+1`, `-4`). A base pode ser a data de criação atual ou a hora do nome. | Erros de fuso horário |
 | **4. Só a data** | Troca dia/mês/ano mantendo a hora original. A hora vem do nome; sem padrão no nome, da mais antiga entre criação e modificação. | Câmera com a data errada mas a hora certa |
 | **5. Metadados da câmera** | Lê a data gravada dentro do arquivo (EXIF/vídeo) e aplica uma correção calculada a partir da hora real de um arquivo de referência. | Câmera com o relógio errado |
+| **6. Desfazer** | Restaura nomes e datas originais da última execução na pasta. Pode ser repetido para voltar várias execuções. | Desfazer um engano |
 
 Nos modos 2 a 5, se o nome seguir o padrão, ele é **renomeado** para a nova data, preservando o prefixo e o sufixo (ex: `_00_025.insp`). Nomes com hora de 5 dígitos (editados à mão, como `IMG_20261108_09319_001.mp4`) também são corrigidos.
 
@@ -66,7 +67,7 @@ Nos modos 2 a 5, se o nome seguir o padrão, ele é **renomeado** para a nova da
    - **Fotos** (JPG, INSP, DNG): `DateTimeOriginal`, `CreateDate` ou `ModifyDate` — hora local da câmera.
    - **Vídeos** (MP4, INSV): `QuickTime:CreateDate` — gravada em **UTC**.
 2. Se o lote tiver fotos **e** vídeos, pergunta o **fuso da câmera** para alinhar os dois. Na Insta360 Ace Pro 2 o valor medido foi **+1h** (padrão ao apertar Enter).
-3. Mostra o arquivo mais antigo do lote e pede a **data/hora real** dele. Se o nome já tiver uma data diferente da câmera, Enter usa a do nome.
+3. Sugere o arquivo mais antigo do lote como **referência** (Enter aceita, ou digite o nome de outro arquivo) e pede a **data/hora real** dele. Se o nome já tiver uma data diferente da câmera, Enter usa a do nome.
 4. Calcula a correção (ex: `+2959 dia(s) 08:00:00`) e aplica a todos os arquivos.
 
 **Exemplo:** câmera marcando 02/10/2018 01:32:01 numa foto tirada em 08/11/2026 09:32:01:
@@ -81,6 +82,8 @@ VID_20181002_020751_015.mp4 -> VID_20261108_110751_015.mp4  [08/11/2026 11:07:51
 ## 🛡️ Segurança
 
 - **Prévia e confirmação** antes de qualquer alteração.
+- **Desfazer:** cada execução grava o nome e as datas originais no arquivo oculto `.ajustar_datas_historico.json`, na pasta processada. O modo 6 restaura a última execução (e pode ser repetido). Os caminhos são relativos, então funciona mesmo que o cartão seja montado com outro nome. Não apague esse arquivo se quiser poder desfazer.
+- **Ctrl+C** durante as perguntas sai sem alterar nada; durante a execução é ignorado para não deixar arquivos pela metade.
 - **Nenhum arquivo é sobrescrito.** Os nomes novos são calculados para o lote inteiro e a renomeação é feita em duas etapas (via nomes temporários), então um arquivo pode assumir o nome antigo de outro sem conflito. Se o nome de destino já pertencer a um arquivo fora do lote, é adicionado um sufixo `_1`, `_2`…
 - Após gravar, o script **confere** se a data de modificação foi realmente aplicada e reporta erro caso contrário.
 
@@ -91,5 +94,5 @@ VID_20181002_020751_015.mp4 -> VID_20261108_110751_015.mp4  [08/11/2026 11:07:51
 - **Cartões SD e discos externos (exFAT/FAT32):** o `SetFile` redefine a data de modificação para a hora atual nesses formatos. O script grava a modificação por último para contornar isso. Em FAT32 as datas têm precisão de 2 segundos.
 - **Data da pasta:** renomear arquivos altera a data de modificação da **pasta** que os contém. Isso é normal.
 - **Data de alteração (ctime):** exibida pelo `ls -lc` e pelo ExifTool como "File Inode Change Date", é sempre a hora da execução — o macOS não permite alterá-la.
-- **Modo 3 é cumulativo:** rodar duas vezes aplica o deslocamento duas vezes.
+- **Modo 3 é cumulativo:** rodar duas vezes aplica o deslocamento duas vezes. Use o modo 6 se isso acontecer.
 - **Acerte o relógio da câmera** para evitar o problema nas próximas gravações.
