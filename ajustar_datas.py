@@ -3,6 +3,7 @@ import os
 import sys
 import re
 import json
+import argparse
 import shutil
 import signal
 import subprocess
@@ -476,7 +477,7 @@ def registrar_execucao(pasta, modo, itens):
     except (OSError, ValueError) as e:
         print(f"\n⚠ Não foi possível salvar o histórico para desfazer: {e}")
 
-def desfazer_ultima_execucao(pasta):
+def desfazer_ultima_execucao(pasta, args):
     """Modo 6: restaura nomes e datas originais da última execução registrada na pasta"""
     try:
         execucoes = carregar_historico(pasta)
@@ -526,8 +527,7 @@ def desfazer_ultima_execucao(pasta):
         print(f"  ... e mais {len(itens) - LIMITE_PREVIA} arquivo(s)")
     print("=" * 60)
 
-    if input("Confirmar a restauração? (s/N): ").strip().lower() not in ('s', 'sim'):
-        print("\nOperação cancelada. Nenhum arquivo foi alterado.")
+    if not confirmar("Confirmar a restauração? (s/N): ", args):
         return 0
     print()
 
@@ -599,118 +599,183 @@ def listar_arquivos(caminho_alvo, mascara):
                 arquivos_encontrados.append(os.path.join(raiz, arquivo))
     return arquivos_encontrados
 
-def configurar_modo_metadados(arquivos):
+def normalizar_mascara(texto):
+    """'dng' -> '*.dng', '.dng' -> '*.dng', '*.dng' -> '*.dng', vazio -> '*'"""
+    texto = (texto or "").strip()
+    if not texto:
+        return "*"
+    if texto.startswith("*"):
+        return texto
+    return f"*{texto}" if texto.startswith(".") else f"*.{texto}"
+
+# Número sequencial da câmera no fim do nome (ex: IMG_20261108_093201_003.dng -> 3)
+PADRAO_SEQUENCIA = re.compile(r"_(\d{3,})\.[^.]+$")
+LIMITE_COMPARACOES_FUSO = 200_000
+
+def detectar_fuso_camera(metadados, candidatos=range(-12, 15)):
     """
-    Modo 5: lê as datas gravadas pela câmera e calcula a correção do relógio a partir
-    da data/hora REAL de um arquivo de referência (o mais antigo do lote).
+    Detecta o fuso da câmera (diferença entre a hora das fotos e a dos vídeos em UTC)
+    usando a numeração sequencial dos arquivos: o fuso certo deixa fotos e vídeos na
+    mesma ordem da numeração. Retorna None se não houver fotos e vídeos numerados ou
+    se mais de um fuso servir igualmente.
     """
-    if not shutil.which("exiftool"):
-        print("Erro: o comando 'exiftool' não foi encontrado. Instale com:")
-        print("  brew install exiftool")
-        sys.exit(1)
+    fotos, videos = [], []
+    for caminho, (dt, video) in metadados.items():
+        match = PADRAO_SEQUENCIA.search(os.path.basename(caminho))
+        if match:
+            (videos if video else fotos).append((int(match.group(1)), dt))
+    if not fotos or not videos:
+        return None
+    # Em lotes muito grandes, usa uma amostra espaçada para manter a detecção rápida
+    while len(fotos) * len(videos) > LIMITE_COMPARACOES_FUSO:
+        if len(fotos) >= len(videos):
+            fotos = fotos[::2]
+        else:
+            videos = videos[::2]
 
-    print(f"\nLendo metadados de {len(arquivos)} arquivo(s)...")
-    metadados = ler_metadados(arquivos)
-    if not metadados:
-        print("Nenhum arquivo com data nos metadados. Saindo.")
-        sys.exit(1)
+    def inversoes(fuso):
+        total = 0
+        for seq_video, dt_video in videos:
+            dt_video = dt_video + timedelta(hours=fuso)
+            for seq_foto, dt_foto in fotos:
+                if seq_foto != seq_video and (seq_foto < seq_video) != (dt_foto < dt_video):
+                    total += 1
+        return total
 
-    qtd_videos = sum(1 for _, eh_video in metadados.values() if eh_video)
-    qtd_fotos = len(metadados) - qtd_videos
-    print(f"Datas encontradas: {qtd_fotos} foto(s), {qtd_videos} vídeo(s).")
+    contagem = {fuso: inversoes(fuso) for fuso in candidatos}
+    menor = min(contagem.values())
+    melhores = [fuso for fuso, qtd in contagem.items() if qtd == menor]
+    return melhores[0] if len(melhores) == 1 else None
 
-    fuso_camera = 0
-    if qtd_videos and qtd_fotos:
-        print("\nVídeos gravam a hora em UTC e fotos na hora local da câmera.")
-        print(f"Na Insta360 Ace Pro 2 a diferença medida foi de {FUSO_CAMERA_PADRAO:+d}h.")
-        while True:
-            fuso_input = input(f"Fuso da câmera em horas (Enter = {FUSO_CAMERA_PADRAO:+d}): ").strip()
-            if not fuso_input:
-                fuso_camera = FUSO_CAMERA_PADRAO
-                break
-            try:
-                fuso_camera = int(fuso_input)
-                break
-            except ValueError:
-                print("Valor inválido! Digite um número inteiro (Ex: +1, -3).")
+# ============================================================================
+# INTERFACE: perguntas interativas e argumentos de linha de comando.
+# Toda pergunta usa o valor do argumento quando ele foi informado.
+# ============================================================================
 
-    referencia = min(metadados, key=lambda c: hora_camera(metadados[c], fuso_camera))
-    print(f"\nArquivo de referência sugerido (o mais antigo do lote): {os.path.basename(referencia)}")
-    por_nome = {os.path.basename(c).lower(): c for c in metadados}
-    while True:
-        escolha = input("Enter para usar este, ou digite o nome de outro arquivo do lote: ").strip()
-        if not escolha:
-            break
-        if escolha.lower() in por_nome:
-            referencia = por_nome[escolha.lower()]
-            break
-        print("Arquivo não encontrado entre os arquivos com data nos metadados. Tente novamente.")
-    dt_ref_camera = hora_camera(metadados[referencia], fuso_camera)
-    dt_ref_nome = extrair_data_nome(os.path.basename(referencia))
+def sair(mensagem, codigo=1):
+    print(mensagem)
+    sys.exit(codigo)
 
-    print(f"\nArquivo de referência: {os.path.basename(referencia)}")
-    print(f"  Hora no relógio da câmera: {dt_ref_camera.strftime('%d/%m/%Y %H:%M:%S')}")
-    dica = ""
-    if dt_ref_nome and dt_ref_nome != dt_ref_camera:
-        dica = f" ou Enter para usar a do nome ({dt_ref_nome.strftime('%d/%m/%Y %H:%M:%S')})"
-    while True:
-        data_input = input(f"Digite a data/hora REAL deste arquivo (DD/MM/AAAA HH:MM:SS){dica}: ").strip()
-        if not data_input and dica:
-            dt_ref_real = dt_ref_nome
-            break
+def perguntar(texto):
+    return input(texto).strip()
+
+def perguntar_sim_nao(texto, valor_cli=None):
+    if valor_cli is not None:
+        return valor_cli
+    return perguntar(texto).lower() in ('s', 'sim')
+
+def obter_data(texto, formato, valor_cli, erro):
+    """Lê uma data do argumento (erro fatal se inválida) ou pergunta até ser válida"""
+    if valor_cli is not None:
         try:
-            dt_ref_real = datetime.strptime(data_input, "%d/%m/%Y %H:%M:%S")
-            break
+            return datetime.strptime(valor_cli.strip(), formato)
         except ValueError:
-            print("Formato inválido! Tente novamente.")
+            sair(f"Erro: {erro} Valor recebido: '{valor_cli}'")
+    while True:
+        try:
+            return datetime.strptime(perguntar(texto), formato)
+        except ValueError:
+            print(f"Formato inválido! {erro}")
 
-    correcao = dt_ref_real - dt_ref_camera
-    print(f"Correção do relógio aplicada a todos os arquivos: {formatar_correcao(correcao)}")
-    return {'metadados': metadados, 'fuso_camera': fuso_camera, 'correcao': correcao}
+def obter_inteiro(texto, valor_cli, padrao=None):
+    if valor_cli is not None:
+        return valor_cli
+    while True:
+        resposta = perguntar(texto)
+        if not resposta and padrao is not None:
+            return padrao
+        try:
+            return int(resposta)  # int() já aceita "+1" e "-3"
+        except ValueError:
+            print("Valor inválido! Digite um número inteiro (Ex: +1, -3).")
 
-def main():
-    if len(sys.argv) < 2:
-        print("Erro: Você precisa passar o caminho de um arquivo ou diretório como parâmetro.")
-        print("\nComo usar no Terminal:")
-        print("  python3 ajustar_datas.py /caminho/da/pasta_ou_arquivo")
-        sys.exit(1)
+def confirmar(texto, args):
+    """Respeita --dry-run (nunca altera) e --sim (não pergunta)"""
+    if args.dry_run:
+        print("\nSimulação (--dry-run): nenhum arquivo foi alterado.")
+        return False
+    if args.sim:
+        return True
+    if perguntar(texto).lower() in ('s', 'sim'):
+        return True
+    print("\nOperação cancelada. Nenhum arquivo foi alterado.")
+    return False
 
-    if not shutil.which("SetFile"):
-        print("Erro: o comando 'SetFile' não foi encontrado.")
-        print("Ele faz parte das Xcode Command Line Tools. Instale com:")
-        print("  xcode-select --install")
-        sys.exit(1)
+def criar_parser():
+    parser = argparse.ArgumentParser(
+        prog="ajustar_datas.py",
+        description="Corrige as datas de criação/modificação (e, opcionalmente, os metadados "
+                    "internos) e o nome de fotos e vídeos no macOS. Opções não informadas são "
+                    "perguntadas interativamente.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""modos:
+  1  data pelo NOME do arquivo
+  2  data MANUAL (só para um arquivo)
+  3  DESLOCAMENTO de horas
+  4  só a DATA, mantendo a hora original
+  5  METADADOS da câmera + correção do relógio (requer exiftool)
+  6  DESFAZER a última execução na pasta
 
+exemplos:
+  python3 ajustar_datas.py /Volumes/Insta360/DCIM/Camera01
+  python3 ajustar_datas.py PASTA --modo 1 --filtro '*' --sem-vid --sem-metadados --sim
+  python3 ajustar_datas.py PASTA --modo 3 --deslocamento -3 --base nome --dry-run
+  python3 ajustar_datas.py PASTA --modo 5 --fuso +1 --hora-real nome --metadados --sim
+  python3 ajustar_datas.py PASTA --modo 6 --sim""")
+    parser.add_argument("caminho", help="arquivo ou pasta a processar")
+    parser.add_argument("--modo", choices=list("123456"), help="modo de operação (veja abaixo)")
+    parser.add_argument("--filtro", help="extensão ou máscara, ex: dng, .insp, *.mp4 ('*' = todos)")
+    parser.add_argument("--data", help='modo 2: "DD/MM/AAAA HH:MM:SS"')
+    parser.add_argument("--deslocamento", type=int, help="modo 3: horas, ex: +1 ou -3")
+    parser.add_argument("--base", choices=["criacao", "nome"],
+                        help="modo 3: base do deslocamento (data de criação ou hora do nome)")
+    parser.add_argument("--nova-data", help="modo 4: DD/MM/AAAA")
+    parser.add_argument("--fuso", type=int, help="modo 5: fuso da câmera em horas (fotos x vídeos)")
+    parser.add_argument("--referencia",
+                        help="modo 5: nome do arquivo de referência (padrão: o mais antigo do lote)")
+    parser.add_argument("--hora-real",
+                        help='modo 5: hora real da referência, "DD/MM/AAAA HH:MM:SS" ou "nome"')
+    grupo_vid = parser.add_mutually_exclusive_group()
+    grupo_vid.add_argument("--vid", dest="prefixo_vid", action="store_true",
+                           help="renomeia vídeos IMG_ para VID_")
+    grupo_vid.add_argument("--sem-vid", dest="prefixo_vid", action="store_false",
+                           help="mantém o prefixo IMG_ dos vídeos")
+    grupo_meta = parser.add_mutually_exclusive_group()
+    grupo_meta.add_argument("--metadados", dest="metadados", action="store_true",
+                            help="grava a data também no EXIF/metadados de vídeo")
+    grupo_meta.add_argument("--sem-metadados", dest="metadados", action="store_false",
+                            help="não altera os metadados internos")
+    parser.add_argument("--dry-run", action="store_true", help="só mostra a prévia, não altera nada")
+    parser.add_argument("--sim", action="store_true", help="não pede confirmação")
+    parser.set_defaults(prefixo_vid=None, metadados=None)
+    return parser
+
+def resolver_caminho(caminho):
     # Usa o caminho exato; só remove espaços/quebras das pontas se o exato não existir
     # (nomes de pasta podem terminar com espaço)
-    caminho_alvo = sys.argv[1]
-    if not os.path.exists(caminho_alvo) and os.path.exists(caminho_alvo.strip()):
-        caminho_alvo = caminho_alvo.strip()
+    if not os.path.exists(caminho) and os.path.exists(caminho.strip()):
+        caminho = caminho.strip()
+    if not os.path.exists(caminho):
+        sair(f"Erro: O caminho fornecido não existe: '{caminho}'")
+    return caminho
 
-    if not os.path.exists(caminho_alvo):
-        print(f"Erro: O caminho fornecido não existe: '{caminho_alvo}'")
-        sys.exit(1)
-
-    eh_diretorio = os.path.isdir(caminho_alvo)
-
-    # Filtro por máscara/extensão
-    mascara = "*"
-    if eh_diretorio:
+def obter_mascara(args, eh_diretorio):
+    if not eh_diretorio:
+        return "*"
+    if args.filtro is not None:
+        mascara = normalizar_mascara(args.filtro)
+    else:
         print("=" * 60)
         print("  FILTRO DE ARQUIVOS")
         print("=" * 60)
-        filtro_input = input("Deseja filtrar por extensão? (Ex: *.dng, *.insp ou deixe em branco para TODOS): ").strip()
-        if filtro_input:
-            # Caso o usuário digite apenas 'dng', transformamos em '*.dng'
-            if not filtro_input.startswith('*'):
-                if filtro_input.startswith('.'):
-                    mascara = f"*{filtro_input}"
-                else:
-                    mascara = f"*.{filtro_input}"
-            else:
-                mascara = filtro_input
-        print(f"Filtro ativo: {mascara} (sem diferenciar maiúsculas)\n")
+        mascara = normalizar_mascara(perguntar(
+            "Deseja filtrar por extensão? (Ex: *.dng, *.insp ou deixe em branco para TODOS): "))
+    print(f"Filtro ativo: {mascara} (sem diferenciar maiúsculas)\n")
+    return mascara
 
+def obter_modo(args, caminho_alvo, eh_diretorio):
+    if args.modo:
+        return args.modo
     print("=" * 60)
     print("  GERENCIADOR E RENOMEADOR DE DATA/HORA (macOS)")
     print("=" * 60)
@@ -729,104 +794,186 @@ def main():
     print("-" * 60)
     print("0. Sair (Não fazer nada)")
     print("=" * 60)
-
-    opcao = input("Digite a opção desejada: ").strip()
-
+    opcao = perguntar("Digite a opção desejada: ")
     if opcao == '0':
-        print("\nOperação cancelada pelo usuário. Saindo...")
-        sys.exit(0)
+        sair("\nOperação cancelada pelo usuário. Saindo...", 0)
+    if opcao not in list("123456"):
+        sair("Opção inválida. Saindo.")
+    return opcao
 
-    pasta_historico = caminho_alvo if eh_diretorio else os.path.dirname(os.path.abspath(caminho_alvo))
-    if opcao == '6':
-        desfazer_ultima_execucao(pasta_historico)
-        sys.exit(0)
+def configurar_modo_metadados(arquivos, args):
+    """
+    Modo 5: lê as datas gravadas pela câmera e calcula a correção do relógio a partir
+    da data/hora REAL de um arquivo de referência (por padrão, o mais antigo do lote).
+    """
+    if not shutil.which("exiftool"):
+        sair("Erro: o comando 'exiftool' não foi encontrado. Instale com:\n  brew install exiftool")
 
-    valor_manual = None
-    deslocamento_horas = None
-    data_fixa_dma = None
-    parametros = {}
+    print(f"\nLendo metadados de {len(arquivos)} arquivo(s)...")
+    metadados = ler_metadados(arquivos)
+    if not metadados:
+        sair("Nenhum arquivo com data nos metadados. Saindo.")
 
-    arquivos = listar_arquivos(caminho_alvo, mascara)
+    qtd_videos = sum(1 for _, video in metadados.values() if video)
+    qtd_fotos = len(metadados) - qtd_videos
+    print(f"Datas encontradas: {qtd_fotos} foto(s), {qtd_videos} vídeo(s).")
 
-    if opcao == '1':
-        print("\nModo: Extração automática pelo nome do arquivo.\n")
-    elif opcao == '2':
-        if eh_diretorio:
-            print("Erro: A opção manual total só pode ser usada para um único arquivo.")
-            sys.exit(1)
+    fuso_camera = 0
+    if qtd_videos and qtd_fotos:
+        detectado = detectar_fuso_camera(metadados)
+        print("\nVídeos gravam a hora em UTC e fotos na hora local da câmera.")
+        if detectado is not None:
+            print(f"Fuso detectado pela numeração dos arquivos: {detectado:+d}h.")
+            padrao = detectado
+        else:
+            print("Não foi possível detectar o fuso pela numeração dos arquivos.")
+            print(f"Na Insta360 Ace Pro 2 a diferença medida foi de {FUSO_CAMERA_PADRAO:+d}h.")
+            padrao = FUSO_CAMERA_PADRAO
+        fuso_camera = obter_inteiro(f"Fuso da câmera em horas (Enter = {padrao:+d}): ", args.fuso, padrao)
+    elif args.fuso is not None:
+        fuso_camera = args.fuso
+
+    por_nome = {os.path.basename(c).lower(): c for c in metadados}
+    referencia = min(metadados, key=lambda c: hora_camera(metadados[c], fuso_camera))
+    if args.referencia is not None:
+        referencia = por_nome.get(os.path.basename(args.referencia).lower())
+        if not referencia:
+            sair(f"Erro: arquivo de referência '{args.referencia}' não está entre os arquivos "
+                 "com data nos metadados.")
+    elif args.hora_real is None:
+        # Com --hora-real e sem --referencia, a hora informada vale para o mais antigo do lote
+        print(f"\nArquivo de referência sugerido (o mais antigo do lote): {os.path.basename(referencia)}")
         while True:
-            data_input = input("Digite a data/hora (Formato: DD/MM/AAAA HH:MM:SS): ").strip()
+            escolha = perguntar("Enter para usar este, ou digite o nome de outro arquivo do lote: ")
+            if not escolha:
+                break
+            if escolha.lower() in por_nome:
+                referencia = por_nome[escolha.lower()]
+                break
+            print("Arquivo não encontrado entre os arquivos com data nos metadados. Tente novamente.")
+
+    dt_ref_camera = hora_camera(metadados[referencia], fuso_camera)
+    dt_ref_nome = extrair_data_nome(os.path.basename(referencia))
+    print(f"\nArquivo de referência: {os.path.basename(referencia)}")
+    print(f"  Hora no relógio da câmera: {dt_ref_camera.strftime(FORMATO_DATA_HORA)}")
+
+    if args.hora_real is not None and args.hora_real.strip().lower() == "nome":
+        if not dt_ref_nome:
+            sair("Erro: --hora-real nome, mas o arquivo de referência não tem data no nome.")
+        dt_ref_real = dt_ref_nome
+    elif args.hora_real is not None:
+        dt_ref_real = obter_data("", FORMATO_DATA_HORA, args.hora_real,
+                                 "Use DD/MM/AAAA HH:MM:SS ou 'nome'.")
+    else:
+        dica = ""
+        if dt_ref_nome and dt_ref_nome != dt_ref_camera:
+            dica = f" ou Enter para usar a do nome ({dt_ref_nome.strftime(FORMATO_DATA_HORA)})"
+        while True:
+            resposta = perguntar(f"Digite a data/hora REAL deste arquivo (DD/MM/AAAA HH:MM:SS){dica}: ")
+            if not resposta and dica:
+                dt_ref_real = dt_ref_nome
+                break
             try:
-                valor_manual = datetime.strptime(data_input, "%d/%m/%Y %H:%M:%S")
+                dt_ref_real = datetime.strptime(resposta, FORMATO_DATA_HORA)
                 break
             except ValueError:
                 print("Formato inválido! Tente novamente.")
-    elif opcao == '3':
-        print("\nAtenção: o deslocamento é cumulativo. Rodar duas vezes aplica duas vezes.")
-        print("Base do deslocamento:")
-        print("  1. Data de criação atual do arquivo (padrão)")
-        print("  2. Hora do NOME do arquivo (arquivos fora do padrão usam a data de criação)")
-        parametros['base_nome'] = input("Escolha (Enter = 1): ").strip() == '2'
-        while True:
-            desloc_input = input("Digite o deslocamento de horas (Ex: +1, -3): ").strip()
-            try:
-                deslocamento_horas = int(desloc_input)  # int() já aceita "+1" e "-3"
-                break
-            except ValueError:
-                print("Valor inválido! Digite um número inteiro.")
-    elif opcao == '4':
-        while True:
-            data_input = input("Digite a nova data desejada (Formato: DD/MM/AAAA): ").strip()
-            try:
-                data_fixa_dma = datetime.strptime(data_input, "%d/%m/%Y")
-                break
-            except ValueError:
-                print("Formato inválido! Use barras e 4 dígitos para o ano (Ex: 08/06/2026).")
-    elif opcao == '5':
-        parametros.update(configurar_modo_metadados(arquivos))
-    else:
-        print("Opção inválida. Saindo.")
-        sys.exit(1)
 
-    parametros.update(valor_manual=valor_manual, deslocamento_horas=deslocamento_horas,
-                      data_fixa_dma=data_fixa_dma)
+    correcao = dt_ref_real - dt_ref_camera
+    print(f"Correção do relógio aplicada a todos os arquivos: {formatar_correcao(correcao)}")
+    return {'metadados': metadados, 'fuso_camera': fuso_camera, 'correcao': correcao}
+
+def obter_parametros_do_modo(modo, args, arquivos, eh_diretorio):
+    parametros = {'valor_manual': None, 'deslocamento_horas': None, 'data_fixa_dma': None}
+    if modo == '1':
+        print("\nModo: Extração automática pelo nome do arquivo.\n")
+    elif modo == '2':
+        if eh_diretorio:
+            sair("Erro: A opção manual total só pode ser usada para um único arquivo.")
+        parametros['valor_manual'] = obter_data(
+            "Digite a data/hora (Formato: DD/MM/AAAA HH:MM:SS): ", FORMATO_DATA_HORA, args.data,
+            "Use DD/MM/AAAA HH:MM:SS.")
+    elif modo == '3':
+        print("\nAtenção: o deslocamento é cumulativo. Rodar duas vezes aplica duas vezes.")
+        if args.base is not None:
+            parametros['base_nome'] = args.base == "nome"
+        else:
+            print("Base do deslocamento:")
+            print("  1. Data de criação atual do arquivo (padrão)")
+            print("  2. Hora do NOME do arquivo (arquivos fora do padrão usam a data de criação)")
+            parametros['base_nome'] = perguntar("Escolha (Enter = 1): ") == '2'
+        parametros['deslocamento_horas'] = obter_inteiro(
+            "Digite o deslocamento de horas (Ex: +1, -3): ", args.deslocamento)
+    elif modo == '4':
+        parametros['data_fixa_dma'] = obter_data(
+            "Digite a nova data desejada (Formato: DD/MM/AAAA): ", "%d/%m/%Y", args.nova_data,
+            "Use barras e 4 dígitos para o ano (Ex: 08/06/2026).")
+    elif modo == '5':
+        parametros.update(configurar_modo_metadados(arquivos, args))
+    return parametros
+
+def main(argv=None):
+    args = criar_parser().parse_args(argv)
+
+    if not shutil.which("SetFile"):
+        sair("Erro: o comando 'SetFile' não foi encontrado.\n"
+             "Ele faz parte das Xcode Command Line Tools. Instale com:\n  xcode-select --install")
+
+    caminho_alvo = resolver_caminho(args.caminho)
+    eh_diretorio = os.path.isdir(caminho_alvo)
+    pasta_historico = caminho_alvo if eh_diretorio else os.path.dirname(os.path.abspath(caminho_alvo))
+
+    if args.modo == '6':  # desfazer não usa filtro
+        desfazer_ultima_execucao(pasta_historico, args)
+        return
+    mascara = obter_mascara(args, eh_diretorio)
+    modo = obter_modo(args, caminho_alvo, eh_diretorio)
+    if modo == '6':
+        desfazer_ultima_execucao(pasta_historico, args)
+        return
+
+    arquivos = listar_arquivos(caminho_alvo, mascara)
+    parametros = obter_parametros_do_modo(modo, args, arquivos, eh_diretorio)
 
     videos_img = [a for a in arquivos if eh_video(a) and os.path.basename(a).startswith("IMG_")]
     if videos_img:
-        resposta = input(f"\n{len(videos_img)} vídeo(s) com prefixo IMG_. Renomear para VID_? (s/N): ")
-        parametros['prefixo_vid'] = resposta.strip().lower() in ('s', 'sim')
+        parametros['prefixo_vid'] = perguntar_sim_nao(
+            f"\n{len(videos_img)} vídeo(s) com prefixo IMG_. Renomear para VID_? (s/N): ",
+            args.prefixo_vid)
 
     gravar_metadados = False
-    if shutil.which("exiftool") and any(suporta_metadados(a) for a in arquivos):
-        print("\nOs metadados internos (EXIF das fotos, datas dos vídeos) são o que apps como")
-        print("Fotos, Lightroom e Insta360 Studio exibem. Gravá-los ALTERA O CONTEÚDO dos arquivos")
-        print("(reversível pelo modo 6).")
-        resposta = input("Gravar a nova data também nos metadados internos? (s/N): ")
-        gravar_metadados = resposta.strip().lower() in ('s', 'sim')
-    total_arquivos = len(arquivos)
-    plano = montar_plano(arquivos, opcao, parametros)
+    if any(suporta_metadados(a) for a in arquivos) and args.metadados is not False:
+        if not shutil.which("exiftool"):
+            if args.metadados:
+                sair("Erro: --metadados requer o exiftool. Instale com:\n  brew install exiftool")
+        else:
+            if args.metadados is None:
+                print("\nOs metadados internos (EXIF das fotos, datas dos vídeos) são o que apps como")
+                print("Fotos, Lightroom e Insta360 Studio exibem. Gravá-los ALTERA O CONTEÚDO dos arquivos")
+                print("(reversível pelo modo 6).")
+            gravar_metadados = perguntar_sim_nao(
+                "Gravar a nova data também nos metadados internos? (s/N): ", args.metadados)
+
+    plano = montar_plano(arquivos, modo, parametros)
 
     sucessos = 0
     if not plano:
         print("\nNenhum arquivo a alterar.")
     else:
-        exibir_previa(plano, caminho_alvo, opcao, gravar_metadados)
-        confirmacao = input("Confirmar as alterações? (s/N): ").strip().lower()
-        if confirmacao in ('s', 'sim'):
+        exibir_previa(plano, caminho_alvo, modo, gravar_metadados)
+        if confirmar("Confirmar as alterações? (s/N): ", args):
             print()
             # Ctrl+C no meio da renomeação deixaria arquivos com nome temporário
             sigint_anterior = signal.signal(signal.SIGINT, signal.SIG_IGN)
             try:
-                sucessos = executar_plano(plano, pasta_historico, opcao, gravar_metadados)
+                sucessos = executar_plano(plano, pasta_historico, modo, gravar_metadados)
             finally:
                 signal.signal(signal.SIGINT, sigint_anterior)
-        else:
-            print("\nOperação cancelada. Nenhum arquivo foi alterado.")
 
     print("\n" + "=" * 40)
     print("           PROCESSO CONCLUÍDO")
     print("=" * 40)
-    print(f"Total de arquivos processados no filtro: {total_arquivos}")
+    print(f"Total de arquivos processados no filtro: {len(arquivos)}")
     print(f"Arquivos atualizados com sucesso: {sucessos}")
     print("=" * 40)
 
