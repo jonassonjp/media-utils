@@ -18,9 +18,9 @@ Legenda: [ ] pendente · [x] concluído
 ## Fase 3 — Funcionalidades
 - [x] 3.1 Corrigir EXIF/metadados de vídeo com exiftool (opcional nos modos 3, 4 e 5)
 - [x] 3.2 Prefixo `VID_` para vídeos
-- [ ] 3.3 Argumentos de linha de comando (`--modo`, `--filtro`, `--dry-run`, `--sim`)
-- [ ] 3.4 Detecção automática do fuso da câmera por pares foto/vídeo
+- [x] 3.3 Argumentos de linha de comando (`--modo`, `--filtro`, `--dry-run`, `--sim`)
+- [x] 3.4 Detecção automática do fuso da câmera por pares foto/vídeo
 
 ## Fase 4 — Qualidade
-- [ ] 4.1 Testes automatizados (`unittest`)
-- [ ] 4.2 Separar interface e lógica
+- [x] 4.1 Testes automatizados (`unittest`)
+- [ ] 4.2 Separar interface e lógica (parcial: perguntas interativas já estão em funções próprias)
